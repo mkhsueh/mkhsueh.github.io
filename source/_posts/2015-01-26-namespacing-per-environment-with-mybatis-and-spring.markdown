@@ -172,7 +172,7 @@ Supply the session factory bean to the DAO layer:
 </beans>
 ```
 
-Now when the application is invoked with VM args {% codeblock %} -Dspring.profiles.active=prod {% endcodeblock %} the session factory that loads namespace-prod.xml gets constructed and injected into the DAO object. Back to implementing features we go!
+Now when the application is invoked with VM args {% codeblock %} -Dspring.profiles.active="prod" {% endcodeblock %} the session factory that loads namespace-prod.xml gets constructed and injected into the DAO object. Back to implementing features we go!
 
 
 
