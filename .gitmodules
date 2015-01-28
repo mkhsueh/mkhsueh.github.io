@@ -4,3 +4,9 @@
 [submodule ".themes/light"]
 	path = .themes/light
 	url = git://github.com/octothemes/classic-light.git
+[submodule ".themes/mullah-mussels"]
+	path = .themes/mullah-mussels
+	url = git://github.com/octothemes/mullah-mussels.git
+[submodule ".themes/murky-mussels"]
+	path = .themes/murky-mussels
+	url = git://github.com/octothemes/murky-mussels.git
