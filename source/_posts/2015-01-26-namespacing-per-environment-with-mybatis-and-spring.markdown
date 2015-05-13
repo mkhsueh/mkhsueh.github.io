@@ -6,7 +6,7 @@ comments: true
 categories: mybatis,spring,namespace,namespaces
 ---
 
-While working with a recent customer, I found that a set of database tables had been namespaced differently in the QA and production environments. My first thought was to ask whether it would be possible to have them mirrored, and what design choice had led to the difference. Turns out their DB replication topology was constrained to one slave host, and there would have been a namespace collision. Shucks! In this post, I explain a generalized version of the way I managed namespaces for different environments using the MyBatis mapping layer with Spring configuration.
+While working with a recent customer, a set of database tables had been namespaced differently in the QA and production environments. Ideally, the namespaces should mirror one another. Unfortunately the DB replication topology was constrained to one slave host, and there would have been a namespace collision. Shucks! In this post, I'll explain a generalized way to manage namespaces for different environments using the MyBatis mapping layer with Spring configuration.
 
 <!-- more -->
 
