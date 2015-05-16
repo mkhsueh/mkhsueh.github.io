@@ -73,7 +73,7 @@ An initial solution was delivered under operational/timeline constraints with th
 
 **An aside on tuning thread count and executor services for various stages:**
 
-I believe in using threads judiciously (I know, it's tempting to add an extra 0 to that thread config). How one does this exactly depends on the application in question. For our particular case, there were two heavily I/O bound stages, with the others being negligible or relatively quick. The number of threads executing the graph were set to two-- allowing each expensive stage to run nearly continuously. Furthermore, the executors for those stages were configured with a thread pool size of one. As a test, the executors' pool sizes were increased to two. This actually caused a degradation in performance by 0.877s for a sample dataset. To understand why this happens, let's look at the visualization of application state. The chart below (part of a monitoring dashboard built using Splunk) shows what happened when the two stages were constrained to one thread each. Tasks represented by the orange bars represent the second most time-intensive stage. Once our pipeline fully becomes staggered, we should expect to get the cost of stage-orange for free (on a timescale only), except for the initial occurrence. In other words, that task's execution is overshadowed by the most expensive stage. 
+I believe in using threads judiciously (I know, it's tempting to add an extra 0 to that thread config). How one does this exactly depends on the application in question. For our particular case, there were two heavily I/O bound stages, with the others being negligible or relatively quick. The number of threads executing the graph were set to two-- allowing each expensive stage to run nearly continuously. Furthermore, the executors for those stages were configured with a thread pool size of one. As a test, the executors' pool sizes were increased to two. This actually caused a degradation in performance by 0.877s for a sample dataset. To understand why this happens, let's look at the visualization of application state. The chart below (part of a monitoring dashboard built using Splunk) shows what happened when the two stages were constrained to one thread each. Tasks represented by the orange bars represent the second most time-intensive stage. Once our pipeline execution fully becomes staggered, we should expect to get the cost of stage-orange for free (on a timescale only), except for the initial occurrence. In other words, that task's execution is overshadowed by the most expensive stage. 
 
 Once thread count is increased, the two threads may concurrently attempt to perform the same stage, splitting available resources. If we examine the total cost of N-1 stage-orange runs, we see that they roughly add up to the one second increase in runtime.  
 
@@ -84,6 +84,7 @@ Once thread count is increased, the two threads may concurrently attempt to perf
      difference in trial run times: 17.474-16.597 = 0.877s
 
      0.644s accounts for most of the difference in performance
+     - of course, there may have been some variability due to network performance
 
 
 {% img center /images/flipper_state_diagram_one_thread.png 'Application State Transition Diagram'%}
