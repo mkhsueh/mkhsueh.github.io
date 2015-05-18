@@ -69,9 +69,6 @@ github_repo_count: 0
 github_show_profile_link: true
 github_skip_forks: true
 
-# Linkedin
-linkedin_user: https://www.linkedin.com/in/michaelhsueh
-
 # Twitter
 twitter_user:
 twitter_tweet_button: true
@@ -102,3 +99,6 @@ google_analytics_tracking_id: UA-59062260-1
 
 # Facebook Like
 facebook_like: true
+
+# Linkedin
+linkedin_user: michaelhsueh
