@@ -1,0 +1,980 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[/home/mkhsueh]]></title>
+  <link href="http://mkhsueh.github.io/atom.xml" rel="self"/>
+  <link href="http://mkhsueh.github.io/"/>
+  <updated>2017-07-22T15:55:57-07:00</updated>
+  <id>http://mkhsueh.github.io/</id>
+  <author>
+    <name><![CDATA[Michael K Hsueh]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[Performance Engineering With a Pipelined Directed Acyclic Graph Pattern]]></title>
+    <link href="http://mkhsueh.github.io/blog/2015/05/13/performance-engineering-with-a-pipelined-directed-acyclic-graph-pattern/"/>
+    <updated>2015-05-13T17:17:47-07:00</updated>
+    <id>http://mkhsueh.github.io/blog/2015/05/13/performance-engineering-with-a-pipelined-directed-acyclic-graph-pattern</id>
+    <content type="html"><![CDATA[<p>On a recent large-scale data migration project, my team encountered throughput issues for a service being developed in our data pipeline. This particular service drove our automated migration, and we needed to scale by orders of magnitude in order to meet the launch schedule. Beginning with addressing bottlenecks and tuning runtime parameters, various performance improvements were made; an optimization that helped us go the distance was rethinking single-threaded sequential execution as a pipelined directed acyclic graph (DAG) execution.</p>
+
+<!-- more -->
+
+
+<p>The particular service under discussion works by continuously streaming and processing data in batches. Up until the point of considering architectural redesign, various parts of the application had been tuned or otherwise parallelized as much as our network/hardware could support. There would be little to no performance benefit from throwing more threads at the issue in a brute-force manner. The key observation at this point was that we would need our slowest I/O-bound processes to run not only as quickly as possible, but as much of the time as possible.</p>
+
+<p>One main loop consisting of several major tasks was executing sequentially. By multithreading the entire main process, we could process multiple batches simultaneously. Conveniently, the main process was already encapsulated as a job. A single threaded execution was done via <a href="http://docs.spring.io/spring/docs/current/javadoc-api/org/springframework/scheduling/concurrent/ThreadPoolTaskExecutor.html">ThreadPoolTaskExecutor.scheduleWithFixedDelay()</a> to allow the entire batch to finish before repeating. What we needed to do here was first change the ThreadPoolTaskExecutor to use scheduleAtFixedRate() and allow concurrent executions. To guard against excessive memory usage by queued tasks, a discard policy was configured for this top-level executor.</p>
+
+<p>Now, what does that accomplish? We&rsquo;re adding more parallelism at the task level, but as stated before, parallelism for individual stages was already achieved by other optimizations. The next step was to actually &ldquo;gate&rdquo; each stage in the process to force pipelining and parallelization of different tasks. To do this, some changes needed to happen:
+</p>
+<strong>1)</strong> Each stage was encapsulated inside a Callable. Callables for intermediate stages were further wrapped inside an <a href="http://docs.guava-libraries.googlecode.com/git-history/v11.0.2/javadoc/com/google/common/util/concurrent/AsyncFunction.html">AsyncFunction</a>.</p>
+
+<p></p></p>
+
+<p><strong>2)</strong> A separate <a href="http://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ExecutorService.html">ExecutorService</a> was used to run each stage. Native Java ExecutorService instances were converted into Guava&rsquo;s ListeningExecutorService to support successive chaining of tasks (via <a href="http://docs.guava-libraries.googlecode.com/git/javadoc/com/google/common/util/concurrent/ListenableFuture.html">ListenableFuture</a> instances returned). Using separate executors for each task allowed different types of tasks to run   in parallel.</p>
+
+<p>Simply running multiple threads through the execution of all tasks at once might have produced this behavior. However, using that approach does not guarantee whether executions end up staggered across I/O intensive stages or all within the same stage.</p>
+
+<p><strong>3)</strong> Splitting sequential tasks into a graph:
+<img class="center" src="http://mkhsueh.github.io/images/DAG_conversion.png" title="Conversion of Sequential Tasks into Task Graph" alt="Conversion of Sequential Tasks into Task Graph"></p>
+
+<p>Pipelining in itself is certainly an improvement. Now that tasks were encapsulated as Callables, independent tasks could run in parallel. Various stages are kicked off and joined using <code>transform()</code> and <code>get()</code>; intermediate stages are represented as an AsyncFunction used to transform results from dependency tasks. The image above shows before/after arrangement of tasks for our application.</p>
+
+<figure class='code'><figcaption><span>fork-join example using ListenableFuture</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class='java'><span class='line'> <span class="kd">private</span> <span class="kd">final</span> <span class="n">ListeningExecutorService</span> <span class="n">executorServiceA</span> <span class="o">=</span> <span class="n">MoreExecutors</span><span class="o">.</span><span class="na">listeningDecorator</span><span class="o">(</span><span class="n">Executors</span><span class="o">.</span><span class="na">newFixedThreadPool</span><span class="o">(</span><span class="mi">2</span><span class="o">));</span>
+</span><span class='line'> <span class="kd">private</span> <span class="kd">final</span> <span class="n">ListeningExecutorService</span> <span class="n">executorServiceB</span> <span class="o">=</span> <span class="n">MoreExecutors</span><span class="o">.</span><span class="na">listeningDecorator</span><span class="o">(</span><span class="n">Executors</span><span class="o">.</span><span class="na">newFixedThreadPool</span><span class="o">(</span><span class="mi">2</span><span class="o">));</span>
+</span><span class='line'>
+</span><span class='line'><span class="c1">// ...</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">Result</span><span class="o">&gt;&gt;</span> <span class="n">taskAFuture</span> <span class="o">=</span> <span class="n">executorServiceA</span>
+</span><span class='line'>                <span class="o">.</span><span class="na">submit</span><span class="o">(</span><span class="k">new</span> <span class="n">Callable</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">Result</span><span class="o">&gt;&gt;()</span> <span class="o">{</span>
+</span><span class='line'>                    <span class="kd">public</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">Result</span><span class="o">&gt;</span> <span class="nf">call</span><span class="o">()</span> <span class="o">{</span>
+</span><span class='line'>                        <span class="kd">final</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">Result</span><span class="o">&gt;</span> <span class="n">result</span> <span class="o">=</span> <span class="n">attemptOperation</span><span class="o">();</span>
+</span><span class='line'>                        <span class="c1">// business logic, return result</span>
+</span><span class='line'>                    <span class="o">}</span>
+</span><span class='line'>                <span class="o">});</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="n">AsyncFunction</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">Result</span><span class="o">&gt;,</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">Integer</span><span class="o">&gt;&gt;</span> <span class="n">functionB</span> <span class="o">=</span> <span class="k">new</span> <span class="n">AsyncFunction</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">Result</span><span class="o">&gt;,</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">Integer</span><span class="o">&gt;&gt;()</span> <span class="o">{</span>
+</span><span class='line'>
+</span><span class='line'>            <span class="nd">@Override</span>
+</span><span class='line'>            <span class="kd">public</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">Integer</span><span class="o">&gt;&gt;</span> <span class="nf">apply</span><span class="o">(</span>
+</span><span class='line'>                    <span class="kd">final</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">Result</span><span class="o">&gt;</span> <span class="n">input</span><span class="o">)</span> <span class="kd">throws</span> <span class="n">Exception</span> <span class="o">{</span>
+</span><span class='line'>                <span class="k">return</span> <span class="n">executorServiceB</span>
+</span><span class='line'>                        <span class="o">.</span><span class="na">submit</span><span class="o">(</span><span class="k">new</span> <span class="n">Callable</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">Integer</span><span class="o">&gt;&gt;()</span> <span class="o">{</span>
+</span><span class='line'>
+</span><span class='line'>                            <span class="nd">@Override</span>
+</span><span class='line'>                            <span class="kd">public</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">Integer</span><span class="o">&gt;</span> <span class="nf">call</span><span class="o">()</span> <span class="kd">throws</span> <span class="n">Exception</span> <span class="o">{</span>
+</span><span class='line'>                                <span class="c1">// business logic, return result</span>
+</span><span class='line'>                            <span class="o">}</span>
+</span><span class='line'>                        <span class="o">});</span>
+</span><span class='line'>            <span class="o">}</span>
+</span><span class='line'>        <span class="o">};</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">Integer</span><span class="o">&gt;&gt;</span> <span class="n">intermediateFuture</span> <span class="o">=</span> <span class="n">Futures</span><span class="o">.</span><span class="na">transform</span><span class="o">(</span><span class="n">taskAFuture</span><span class="o">,</span> <span class="n">functionB</span><span class="o">);</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="c1">// other tasks are initialized, with varying degrees of fanout and joining</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="n">Futures</span><span class="o">.</span><span class="na">allAsList</span><span class="o">(</span><span class="n">finalFutureX</span><span class="o">,</span> <span class="n">finalFutureY</span><span class="o">).</span><span class="na">get</span><span class="o">();</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>An initial solution was delivered under operational/timeline constraints with the above approach. Just imagine more stages with more interdependencies. Examined in isolation, the result was an increase in throughput, by a factor of approximately 1.83x. Keep in mind, an architectural reorganization can compound upon smaller changes; combined with other optimizations made to this app, we&rsquo;ve seen up to a 132x peak gain in production throughput.</p>
+
+<p><strong>An aside on tuning thread count and executor services for various stages:</strong></p>
+
+<p>I believe in using threads judiciously (I know, it&rsquo;s tempting to add an extra 0 to that thread config). For our particular case, there were two heavily I/O bound stages, with the others being negligible or relatively quick. The number of threads executing the graph were set to two&ndash; allowing each expensive stage to run nearly continuously. Furthermore, the executors for those expensive stages were configured with a thread pool size of one. As a test, the executors&#8217; pool sizes were increased to two. This actually caused a degradation in performance by 0.877s for a sample dataset; To understand why this happens, let&rsquo;s look at the visualization of application state. The chart below (part of a monitoring dashboard built using Splunk) shows what happened when the two stages were constrained to one thread each. Tasks represented by the orange bars represent the second most time-intensive stage. Once our pipeline fully engages each stage, we should expect to get the cost of stage-orange for free (on a timescale only), except for the initial occurrence. In other words, that task&rsquo;s execution is overshadowed by the most expensive stage.</p>
+
+<p><img class="center" src="http://mkhsueh.github.io/images/flipper_state_diagram_one_thread.png" title="'Application State Transition Diagram'" ></p>
+
+<p>Once thread count is increased, the two threads may concurrently attempt to perform the same stage, splitting available resources. If we examine the total cost of N-1 stage-orange runs, we see that roughly accounts for the one second increase in runtime.</p>
+
+<pre><code> estimated times for ops, not counting the initial execution:
+ 0.102s + 0.108s + 0.119s + 0.1s + 0.121s + 0.094s
+ total = 0.644s
+
+ difference in trial run times: 17.474-16.597 = 0.877s
+
+ 0.644s accounts for most of the difference in performance
+ - of course, there may have been some variability due to network performance
+</code></pre>
+
+<p><strong>Generalizing the design:</strong></p>
+
+<p>Manually stringing up a series of asynchronous tasks and transformations isn&rsquo;t exactly the picture of maintainability and extensibility we want to see in our applications. The next challenge was refactoring this process to make it reuseable and configurable. We can decompose this pattern into the following:</p>
+
+<ul>
+<li>specification of tasks as a graph</li>
+<li>chaining and joining of tasks</li>
+</ul>
+
+
+<p>Each &ldquo;stage&rdquo; or task was rewritten as a <a href="http://docs.guava-libraries.googlecode.com/git/javadoc/com/google/common/base/Function.html">Function</a>&lt;I, O> class. Defining a task graph was done by specifying the list of dependencies for each stage, along with the work encapsulated within a Function, and the executor service for each stage. That gives us all the specifications we need to initiate a stage. Essentially, we used a modified adjacency list representation for a graph.</p>
+
+<p>To automatically initiate tasks in dependency order, a depth-first search was performed from each task in the graph. No task begins executing until dependencies complete, and results from the dependencies are passed into the function. We could have done a topological sort to determine dependency ordering. However, the implementation was simplified using the design assumption that crawling the graph and initializing tasks in memory is relatively inexpensive (on the order of milliseconds, happening once per graph execution).</p>
+
+<p>We also needed to validate the graph as an acyclic graph; cycles could cause tasks to block on execution, or even a stack overflow error from recursively initializing dependencies. The graph is first validated by a custom <code>AcyclicGraph</code> class, which is then consumed by a <code>TaskGraphExecutor</code> that executes the graph. Internally, the <code>AcyclicGraph</code> is backed by a task graph mapping (adjacency list-like representation discussed earlier). The task graph mapping is created in Spring via XML configuration as a map. Excluding writing new services, we can configure executor services for each stage, reconfigure the graph, or incorporate new tasks using XML&ndash; all without touching any Java application code.</p>
+
+<p>The <code>TaskGraphExecutor</code> executes a task graph. You&rsquo;ll notice that working with <code>ListenableFuture</code> gives us the added convenience of choosing an asynchronous or synchronous computation of the overall graph, exposed by <code>computeGraphAsync()</code> and <code>computeGraphSynchronously()</code>.</p>
+
+<figure class='code'><figcaption><span>executor for an acyclic task graph</span><a href='https://gist.github.com/mkhsueh/d75cd6bc2ed3b61a947f'>gist</a></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+</pre></td><td class='code'><pre><code class='java'><span class='line'><span class="kn">package</span> <span class="n">com</span><span class="o">.</span><span class="na">mkhsueh</span><span class="o">.</span><span class="na">example</span><span class="o">.</span><span class="na">pipeline</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.HashMap</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.List</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.Map</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.concurrent.ExecutionException</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kn">import</span> <span class="nn">org.slf4j.Logger</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">org.slf4j.LoggerFactory</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.collect.Lists</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.util.concurrent.AsyncFunction</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.util.concurrent.Futures</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.util.concurrent.ListenableFuture</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kn">import</span> <span class="nn">static</span> <span class="n">com</span><span class="o">.</span><span class="na">google</span><span class="o">.</span><span class="na">common</span><span class="o">.</span><span class="na">base</span><span class="o">.</span><span class="na">Preconditions</span><span class="o">.*;</span>
+</span><span class='line'>
+</span><span class='line'><span class="cm">/**</span>
+</span><span class='line'><span class="cm"> * Executes a directed acyclic graph of tasks. Thread-safe. </span>
+</span><span class='line'><span class="cm"> *</span>
+</span><span class='line'><span class="cm"> * @param &lt;I&gt; the return type of tasks</span>
+</span><span class='line'><span class="cm"> * @author Michael K Hsueh</span>
+</span><span class='line'><span class="cm"> */</span>
+</span><span class='line'><span class="kd">public</span> <span class="kd">class</span> <span class="nc">TaskGraphExecutor</span> <span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span> <span class="o">{</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">private</span> <span class="kd">static</span> <span class="kd">final</span> <span class="n">Logger</span> <span class="n">LOG</span> <span class="o">=</span> <span class="n">LoggerFactory</span><span class="o">.</span><span class="na">getLogger</span><span class="o">(</span><span class="n">TaskGraphExecutor</span><span class="o">.</span><span class="na">class</span><span class="o">);</span>
+</span><span class='line'>    <span class="kd">private</span> <span class="kd">final</span> <span class="n">AcyclicGraph</span><span class="o">&lt;</span><span class="n">TaskGraphTuple</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;,</span> <span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">taskGraph</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="cm">/**</span>
+</span><span class='line'><span class="cm">     * </span>
+</span><span class='line'><span class="cm">     * @param taskGraph</span>
+</span><span class='line'><span class="cm">     *            represents a description of a directed acyclic graph of tasks.</span>
+</span><span class='line'><span class="cm">     *            Keys are vertexes, and each {@link TaskGraphTuple} contains a</span>
+</span><span class='line'><span class="cm">     *            listing of the dependencies for that vertex--edges flow from</span>
+</span><span class='line'><span class="cm">     *            the dependencies to the current vertex. Task graphs with</span>
+</span><span class='line'><span class="cm">     *            cycles are considered invalid and will not execute.</span>
+</span><span class='line'><span class="cm">     */</span>
+</span><span class='line'>    <span class="kd">public</span> <span class="nf">TaskGraphExecutor</span><span class="o">(</span>
+</span><span class='line'>            <span class="n">AcyclicGraph</span><span class="o">&lt;</span><span class="n">TaskGraphTuple</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;,</span> <span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">taskGraph</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">this</span><span class="o">.</span><span class="na">taskGraph</span> <span class="o">=</span> <span class="n">checkNotNull</span><span class="o">(</span><span class="n">taskGraph</span><span class="o">);</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="cm">/**</span>
+</span><span class='line'><span class="cm">     * Initializes task graph and returns an aggregate future. Caller should</span>
+</span><span class='line'><span class="cm">     * block on future.get() to wait for completion.</span>
+</span><span class='line'><span class="cm">     * </span>
+</span><span class='line'><span class="cm">     * @return aggregate future</span>
+</span><span class='line'><span class="cm">     */</span>
+</span><span class='line'>    <span class="kd">public</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="nf">computeGraphAsync</span><span class="o">()</span> <span class="o">{</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="n">Map</span><span class="o">&lt;</span><span class="n">String</span><span class="o">,</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">futuresMapping</span> <span class="o">=</span> <span class="k">new</span> <span class="n">HashMap</span><span class="o">&lt;</span><span class="n">String</span><span class="o">,</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;();</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">for</span> <span class="o">(</span><span class="n">String</span> <span class="n">key</span> <span class="o">:</span> <span class="n">taskGraph</span><span class="o">.</span><span class="na">keySet</span><span class="o">())</span> <span class="o">{</span>
+</span><span class='line'>            <span class="n">populateFuture</span><span class="o">(</span><span class="n">key</span><span class="o">,</span> <span class="n">futuresMapping</span><span class="o">);</span>
+</span><span class='line'>        <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">return</span> <span class="n">Futures</span><span class="o">.</span><span class="na">allAsList</span><span class="o">(</span><span class="n">futuresMapping</span><span class="o">.</span><span class="na">values</span><span class="o">());</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="cm">/**</span>
+</span><span class='line'><span class="cm">     * Returns final result list from the task graph once all tasks complete.</span>
+</span><span class='line'><span class="cm">     * The actual graph execution can still run with parallelization as</span>
+</span><span class='line'><span class="cm">     * configured.</span>
+</span><span class='line'><span class="cm">     * </span>
+</span><span class='line'><span class="cm">     * @return aggregate results</span>
+</span><span class='line'><span class="cm">     * @throws InterruptedException</span>
+</span><span class='line'><span class="cm">     * @throws ExecutionException</span>
+</span><span class='line'><span class="cm">     */</span>
+</span><span class='line'>    <span class="kd">public</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span> <span class="nf">computeGraphSynchronously</span><span class="o">()</span> <span class="kd">throws</span> <span class="n">InterruptedException</span><span class="o">,</span> <span class="n">ExecutionException</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">return</span> <span class="nf">computeGraphAsync</span><span class="o">().</span><span class="na">get</span><span class="o">();</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">private</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span> <span class="nf">populateFuture</span><span class="o">(</span><span class="n">String</span> <span class="n">key</span><span class="o">,</span> <span class="n">Map</span><span class="o">&lt;</span><span class="n">String</span><span class="o">,</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">futuresMapping</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>        <span class="kd">final</span> <span class="n">TaskGraphTuple</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;,</span> <span class="n">I</span><span class="o">&gt;</span> <span class="n">tuple</span> <span class="o">=</span> <span class="n">taskGraph</span><span class="o">.</span><span class="na">get</span><span class="o">(</span><span class="n">key</span><span class="o">);</span>
+</span><span class='line'>        <span class="n">List</span><span class="o">&lt;</span><span class="n">String</span><span class="o">&gt;</span> <span class="n">dependencyKeys</span> <span class="o">=</span> <span class="n">tuple</span><span class="o">.</span><span class="na">getDependencyKeys</span><span class="o">();</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">if</span> <span class="o">(</span><span class="n">notStarted</span><span class="o">(</span><span class="n">key</span><span class="o">,</span> <span class="n">futuresMapping</span><span class="o">))</span> <span class="o">{</span>
+</span><span class='line'>            <span class="c1">// use dependencies</span>
+</span><span class='line'>            <span class="n">AsyncFunction</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;,</span> <span class="n">I</span><span class="o">&gt;</span> <span class="n">taskAsFxn</span> <span class="o">=</span> <span class="n">tuple</span><span class="o">.</span><span class="na">getAsyncFunction</span><span class="o">();</span>
+</span><span class='line'>            <span class="k">try</span> <span class="o">{</span>
+</span><span class='line'>                <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">dependencies</span> <span class="o">=</span> <span class="n">startAndGetAggregateDependencies</span><span class="o">(</span><span class="n">dependencyKeys</span><span class="o">,</span> <span class="n">futuresMapping</span><span class="o">);</span>
+</span><span class='line'>                <span class="n">futuresMapping</span><span class="o">.</span><span class="na">put</span><span class="o">(</span><span class="n">key</span><span class="o">,</span> <span class="n">Futures</span><span class="o">.</span><span class="na">transform</span><span class="o">(</span><span class="n">dependencies</span><span class="o">,</span> <span class="n">taskAsFxn</span><span class="o">));</span>
+</span><span class='line'>            <span class="o">}</span> <span class="k">catch</span> <span class="o">(</span><span class="n">ClassCastException</span> <span class="n">e</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>                <span class="n">String</span> <span class="n">msg</span> <span class="o">=</span> <span class="n">String</span><span class="o">.</span><span class="na">format</span><span class="o">(</span><span class="s">&quot;Unexpected input types from dependency tasks [%s] for task [%s]&quot;</span><span class="o">,</span> <span class="n">dependencyKeys</span><span class="o">,</span> <span class="n">key</span><span class="o">);</span>
+</span><span class='line'>                <span class="n">LOG</span><span class="o">.</span><span class="na">error</span><span class="o">(</span><span class="n">msg</span><span class="o">,</span> <span class="n">e</span><span class="o">);</span>
+</span><span class='line'>                <span class="k">throw</span> <span class="k">new</span> <span class="nf">RuntimeException</span><span class="o">(</span><span class="n">msg</span><span class="o">,</span> <span class="n">e</span><span class="o">);</span>
+</span><span class='line'>            <span class="o">}</span> <span class="k">catch</span> <span class="o">(</span><span class="n">NullPointerException</span> <span class="n">e</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>                <span class="n">String</span> <span class="n">msg</span> <span class="o">=</span> <span class="n">String</span><span class="o">.</span><span class="na">format</span><span class="o">(</span><span class="s">&quot;Null pointer given dependency tasks [%s] for task [%s]; check configuration to ensure required dependencies were specified for the task&quot;</span><span class="o">,</span>
+</span><span class='line'>                                <span class="n">dependencyKeys</span><span class="o">,</span> <span class="n">key</span><span class="o">);</span>
+</span><span class='line'>                <span class="n">LOG</span><span class="o">.</span><span class="na">error</span><span class="o">(</span><span class="n">msg</span><span class="o">,</span> <span class="n">e</span><span class="o">);</span>
+</span><span class='line'>                <span class="k">throw</span> <span class="k">new</span> <span class="nf">RuntimeException</span><span class="o">(</span><span class="n">msg</span><span class="o">,</span> <span class="n">e</span><span class="o">);</span>
+</span><span class='line'>            <span class="o">}</span>
+</span><span class='line'>        <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">return</span> <span class="n">futuresMapping</span><span class="o">.</span><span class="na">get</span><span class="o">(</span><span class="n">key</span><span class="o">);</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">private</span> <span class="kt">boolean</span> <span class="nf">notStarted</span><span class="o">(</span><span class="n">String</span> <span class="n">key</span><span class="o">,</span>
+</span><span class='line'>            <span class="n">Map</span><span class="o">&lt;</span><span class="n">String</span><span class="o">,</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">futuresMapping</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">return</span> <span class="n">futuresMapping</span><span class="o">.</span><span class="na">get</span><span class="o">(</span><span class="n">key</span><span class="o">)</span> <span class="o">==</span> <span class="kc">null</span><span class="o">;</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">private</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">List</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="nf">startAndGetAggregateDependencies</span><span class="o">(</span><span class="n">List</span><span class="o">&lt;</span><span class="n">String</span><span class="o">&gt;</span> <span class="n">dependencyKeys</span><span class="o">,</span>
+</span><span class='line'>            <span class="n">Map</span><span class="o">&lt;</span><span class="n">String</span><span class="o">,</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">futuresMapping</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>        <span class="n">List</span><span class="o">&lt;</span><span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;&gt;</span> <span class="n">dependencyFutures</span> <span class="o">=</span> <span class="n">Lists</span><span class="o">.</span><span class="na">newArrayList</span><span class="o">();</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="c1">// handle independent task</span>
+</span><span class='line'>        <span class="k">if</span> <span class="o">(</span><span class="n">dependencyKeys</span><span class="o">.</span><span class="na">isEmpty</span><span class="o">())</span> <span class="o">{</span>
+</span><span class='line'>            <span class="k">return</span> <span class="n">Futures</span><span class="o">.</span><span class="na">immediateFuture</span><span class="o">(</span><span class="kc">null</span><span class="o">);</span> <span class="c1">// null avoids cast errors;</span>
+</span><span class='line'>                                                  <span class="c1">// reasonably safe</span>
+</span><span class='line'>                                                  <span class="c1">// since independent tasks</span>
+</span><span class='line'>                                                  <span class="c1">// should not read inputs</span>
+</span><span class='line'>        <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">for</span> <span class="o">(</span><span class="n">String</span> <span class="n">key</span> <span class="o">:</span> <span class="n">dependencyKeys</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>            <span class="k">if</span> <span class="o">(</span><span class="n">notStarted</span><span class="o">(</span><span class="n">key</span><span class="o">,</span> <span class="n">futuresMapping</span><span class="o">))</span> <span class="o">{</span>
+</span><span class='line'>                <span class="n">populateFuture</span><span class="o">(</span><span class="n">key</span><span class="o">,</span> <span class="n">futuresMapping</span><span class="o">);</span>
+</span><span class='line'>            <span class="o">}</span>
+</span><span class='line'>        <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">for</span> <span class="o">(</span><span class="n">String</span> <span class="n">key</span> <span class="o">:</span> <span class="n">dependencyKeys</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>            <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span> <span class="n">dependencyFuture</span> <span class="o">=</span> <span class="n">futuresMapping</span><span class="o">.</span><span class="na">get</span><span class="o">(</span><span class="n">key</span><span class="o">);</span>
+</span><span class='line'>            <span class="n">dependencyFutures</span><span class="o">.</span><span class="na">add</span><span class="o">(</span><span class="n">dependencyFuture</span><span class="o">);</span>
+</span><span class='line'>        <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">return</span> <span class="n">Futures</span><span class="o">.</span><span class="na">allAsList</span><span class="o">(</span><span class="n">dependencyFutures</span><span class="o">);</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="o">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Below is the helper class <code>TaskGraphTuple</code>, which encapsulates converting <code>Function</code> to <code>AsyncFunction</code>.</p>
+
+<figure class='code'><figcaption><span>TaskGraphTuple.java</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+</pre></td><td class='code'><pre><code class='java'><span class='line'><span class="kn">package</span> <span class="n">com</span><span class="o">.</span><span class="na">mkhsueh</span><span class="o">.</span><span class="na">example</span><span class="o">.</span><span class="na">pipeline</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.Collections</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.List</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.concurrent.Callable</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">java.util.concurrent.ExecutorService</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.base.Function</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.util.concurrent.AsyncFunction</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.util.concurrent.ListenableFuture</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.util.concurrent.ListeningExecutorService</span><span class="o">;</span>
+</span><span class='line'><span class="kn">import</span> <span class="nn">com.google.common.util.concurrent.MoreExecutors</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kn">import</span> <span class="nn">static</span> <span class="n">com</span><span class="o">.</span><span class="na">google</span><span class="o">.</span><span class="na">common</span><span class="o">.</span><span class="na">base</span><span class="o">.</span><span class="na">Preconditions</span><span class="o">.*;</span>
+</span><span class='line'>
+</span><span class='line'><span class="kd">public</span> <span class="kd">class</span> <span class="nc">TaskGraphTuple</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="o">{</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">private</span> <span class="kd">final</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">String</span><span class="o">&gt;</span> <span class="n">dependencyKeys</span><span class="o">;</span>
+</span><span class='line'>    <span class="kd">private</span> <span class="kd">final</span> <span class="n">Function</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="n">function</span><span class="o">;</span>
+</span><span class='line'>    <span class="kd">private</span> <span class="kd">final</span> <span class="n">ListeningExecutorService</span> <span class="n">executorService</span><span class="o">;</span>
+</span><span class='line'>    <span class="kd">private</span> <span class="n">AsyncFunction</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="n">asyncFunction</span><span class="o">;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">public</span> <span class="nf">TaskGraphTuple</span><span class="o">(</span><span class="n">List</span><span class="o">&lt;</span><span class="n">String</span><span class="o">&gt;</span> <span class="n">dependencyKeys</span><span class="o">,</span> <span class="n">Function</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="n">task</span><span class="o">,</span> <span class="n">ExecutorService</span> <span class="n">executorService</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">this</span><span class="o">.</span><span class="na">dependencyKeys</span> <span class="o">=</span> <span class="n">checkNotNull</span><span class="o">(</span><span class="n">dependencyKeys</span><span class="o">);</span>
+</span><span class='line'>        <span class="k">this</span><span class="o">.</span><span class="na">function</span> <span class="o">=</span> <span class="n">checkNotNull</span><span class="o">(</span><span class="n">task</span><span class="o">);</span>
+</span><span class='line'>        <span class="k">this</span><span class="o">.</span><span class="na">executorService</span> <span class="o">=</span> <span class="n">MoreExecutors</span><span class="o">.</span><span class="na">listeningDecorator</span><span class="o">(</span><span class="n">checkNotNull</span><span class="o">(</span><span class="n">executorService</span><span class="o">));</span>
+</span><span class='line'>        <span class="k">this</span><span class="o">.</span><span class="na">asyncFunction</span> <span class="o">=</span> <span class="n">createAsyncFunction</span><span class="o">(</span><span class="k">this</span><span class="o">.</span><span class="na">function</span><span class="o">,</span> <span class="k">this</span><span class="o">.</span><span class="na">executorService</span><span class="o">);</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">private</span> <span class="n">AsyncFunction</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="nf">createAsyncFunction</span><span class="o">(</span>
+</span><span class='line'>            <span class="kd">final</span> <span class="n">Function</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="n">fxn</span><span class="o">,</span>
+</span><span class='line'>            <span class="kd">final</span> <span class="n">ListeningExecutorService</span> <span class="n">executorService</span><span class="o">)</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">return</span> <span class="k">new</span> <span class="n">AsyncFunction</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;()</span> <span class="o">{</span>
+</span><span class='line'>
+</span><span class='line'>            <span class="nd">@Override</span>
+</span><span class='line'>            <span class="kd">public</span> <span class="n">ListenableFuture</span><span class="o">&lt;</span><span class="n">O</span><span class="o">&gt;</span> <span class="nf">apply</span><span class="o">(</span><span class="kd">final</span> <span class="n">I</span> <span class="n">input</span><span class="o">)</span> <span class="kd">throws</span> <span class="n">Exception</span> <span class="o">{</span>
+</span><span class='line'>                <span class="k">return</span> <span class="n">executorService</span><span class="o">.</span><span class="na">submit</span><span class="o">(</span><span class="k">new</span> <span class="n">Callable</span><span class="o">&lt;</span><span class="n">O</span><span class="o">&gt;()</span> <span class="o">{</span>
+</span><span class='line'>
+</span><span class='line'>                    <span class="nd">@Override</span>
+</span><span class='line'>                    <span class="kd">public</span> <span class="n">O</span> <span class="nf">call</span><span class="o">()</span> <span class="kd">throws</span> <span class="n">Exception</span> <span class="o">{</span>
+</span><span class='line'>                        <span class="k">return</span> <span class="n">fxn</span><span class="o">.</span><span class="na">apply</span><span class="o">(</span><span class="n">input</span><span class="o">);</span>
+</span><span class='line'>                    <span class="o">}</span>
+</span><span class='line'>                <span class="o">});</span>
+</span><span class='line'>            <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="o">};</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">public</span> <span class="n">List</span><span class="o">&lt;</span><span class="n">String</span><span class="o">&gt;</span> <span class="nf">getDependencyKeys</span><span class="o">()</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">return</span> <span class="n">Collections</span><span class="o">.</span><span class="na">unmodifiableList</span><span class="o">(</span><span class="n">dependencyKeys</span><span class="o">);</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">public</span> <span class="n">Function</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="nf">getFunction</span><span class="o">()</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">return</span> <span class="n">function</span><span class="o">;</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">public</span> <span class="n">ListeningExecutorService</span> <span class="nf">getExecutorService</span><span class="o">()</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">return</span> <span class="n">executorService</span><span class="o">;</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="kd">public</span> <span class="n">AsyncFunction</span><span class="o">&lt;</span><span class="n">I</span><span class="o">,</span> <span class="n">O</span><span class="o">&gt;</span> <span class="nf">getAsyncFunction</span><span class="o">()</span> <span class="o">{</span>
+</span><span class='line'>        <span class="k">return</span> <span class="n">asyncFunction</span><span class="o">;</span>
+</span><span class='line'>    <span class="o">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="o">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Lastly, here&rsquo;s an example configuration file. All the configuration is done in one file here for brevity.</p>
+
+<figure class='code'><figcaption><span>example Spring configuration file</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+</pre></td><td class='code'><pre><code class='xml'><span class='line'><span class="c">&lt;!-- pipeline stages --&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;serviceA&quot;</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.pipeline.ServiceA&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;constructorArg1&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;constructorArg2&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;serviceB&quot;</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.pipeline.ServiceB&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;constructorArg1&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;constructorArg2&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="c">&lt;!-- task graph setup --&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;executorA&quot;</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.concurrent.ExecutorServiceFactory&quot;</span> <span class="na">factory-method=</span><span class="s">&quot;newFixedThreadPool&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">value=</span><span class="s">&quot;${serviceA.jobThreadPoolCount}&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">value=</span><span class="s">&quot;${serviceA.jobThreadPoolName}&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;executorB&quot;</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.concurrent.ExecutorServiceFactory&quot;</span> <span class="na">factory-method=</span><span class="s">&quot;newFixedThreadPool&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">value=</span><span class="s">&quot;${serviceB.jobThreadPoolCount}&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">value=</span><span class="s">&quot;${serviceB.jobThreadPoolName}&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;tupleA&quot;</span>  <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.pipeline.TaskGraphTuple&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;list&gt;&lt;/list&gt;</span>  <span class="c">&lt;!-- dependency tasks go here --&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;/constructor-arg&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;serviceA&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;executorA&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;tupleB&quot;</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.pipeline.TaskGraphTuple&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;list&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>serviceA<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/list&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;/constructor-arg&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;serviceB&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;executorB&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;taskGraphMapping&quot;</span> <span class="na">class=</span><span class="s">&quot;java.util.HashMap&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;map</span> <span class="na">key-type=</span><span class="s">&quot;java.lang.String&quot;</span> <span class="na">value-type=</span><span class="s">&quot;com.mkhsueh.example.pipeline.TaskGraphTuple&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>             <span class="nt">&lt;entry</span> <span class="na">key=</span><span class="s">&quot;serviceA&quot;</span> <span class="na">value-ref=</span><span class="s">&quot;tupleA&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>             <span class="nt">&lt;entry</span> <span class="na">key=</span><span class="s">&quot;serviceB&quot;</span> <span class="na">value-ref=</span><span class="s">&quot;tupleB&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/map&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;/constructor-arg&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;acyclicTaskGraph&quot;</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.pipeline.AcyclicTaskGraph&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;taskGraphMapping&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;taskGraphExecutor&quot;</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.pipeline.TaskGraphExecutor&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>      <span class="nt">&lt;constructor-arg</span> <span class="na">ref=</span><span class="s">&quot;acyclicTaskGraph&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'><span class="nt">&lt;/bean&gt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Update 7/16/17:</p>
+
+<p>We used this system at Zappos to finalize customer data migrations in its Super Cloud infrastructure transition to Amazon. This morning, I learned the project had completed. Props to the team for closing what was likely the &ldquo;single largest e-commerce replatforming in history&rdquo;! <a href="http://highscalability.com/blog/2015/10/7/zapposs-website-frozen-for-two-years-as-it-integrates-with-a.html">[1]</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Environment Namespacing With MyBatis and Spring]]></title>
+    <link href="http://mkhsueh.github.io/blog/2015/01/26/namespacing-per-environment-with-mybatis-and-spring/"/>
+    <updated>2015-01-26T19:16:47-08:00</updated>
+    <id>http://mkhsueh.github.io/blog/2015/01/26/namespacing-per-environment-with-mybatis-and-spring</id>
+    <content type="html"><![CDATA[<p>While working with a recent customer, a set of database tables had been namespaced differently in the QA and production environments. Ideally, the namespaces should mirror one another. Unfortunately the DB replication topology was constrained to one slave host, and there would have been a namespace collision. Shucks! In this post, I&rsquo;ll explain how we managed namespaces for different environments using the MyBatis mapping layer with Spring configuration.</p>
+
+<!-- more -->
+
+
+<p>By decomposing the XML configuration, it&rsquo;s possible to select desired namespaces via Spring profiles. For reference, Spring profiles effectively group bean definitions, which are instantiated when the profiles are invoked.</p>
+
+<p>We start by examining sample MyBatis mapper files. Let&rsquo;s say we want to handle multiple namespaces for the &ldquo;object&rdquo; table:</p>
+
+<figure class='code'><figcaption><span>common-methods.xml</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class='xml'><span class='line'><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+</span><span class='line'><span class="cp">&lt;!DOCTYPE mapper PUBLIC &quot;-//mybatis.org//DTD Mapper 3.0//EN&quot; &quot;http://mybatis.org/dtd/mybatis-3-mapper.dtd&quot;&gt;</span>
+</span><span class='line'><span class="nt">&lt;mapper</span> <span class="na">namespace=</span><span class="s">&quot;com.mkhsueh.example.mapper&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="nt">&lt;sql</span> <span class="na">id=</span><span class="s">&quot;excludeFailed&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        LEFT JOIN pp.object o
+</span><span class='line'>        ON (failureCandidates.customer_id = o.source_id)
+</span><span class='line'>        LEFT JOIN pp.object_type ot
+</span><span class='line'>        ON ot.object_type_id = o.object_type_id
+</span><span class='line'>        WHERE o.source_id IS NULL OR
+</span><span class='line'>        (ot.type = &#39;Purchase&#39; AND o.failure_count = 0)
+</span><span class='line'>  <span class="nt">&lt;/sql&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;/mapper&gt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>A <sql> tag denotes SQL fragments that can be reused within the same file, or any other file loaded by the same session factory. The first thing we do is abstract the namespace into a SQL fragment, such that we can refer to it via the refid.</p>
+
+<p>Represent the namespace fragments in their own configuration files:</p>
+
+<figure class='code'><figcaption><span>namespace-qa.xml</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class='xml'><span class='line'><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+</span><span class='line'><span class="cp">&lt;!DOCTYPE mapper PUBLIC &quot;-//mybatis.org//DTD Mapper 3.0//EN&quot; &quot;http://mybatis.org/dtd/mybatis-3-mapper.dtd&quot;&gt;</span>
+</span><span class='line'><span class="nt">&lt;mapper</span> <span class="na">namespace=</span><span class="s">&quot;com.mkhsueh.example.mapper.namespace&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="nt">&lt;sql</span> <span class="na">id=</span><span class="s">&quot;purchase&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        pq.
+</span><span class='line'>    <span class="nt">&lt;/sql&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;/mapper&gt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><figcaption><span>namespace-prod.xml</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class='xml'><span class='line'><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+</span><span class='line'><span class="cp">&lt;!DOCTYPE mapper PUBLIC &quot;-//mybatis.org//DTD Mapper 3.0//EN&quot; &quot;http://mybatis.org/dtd/mybatis-3-mapper.dtd&quot;&gt;</span>
+</span><span class='line'><span class="nt">&lt;mapper</span> <span class="na">namespace=</span><span class="s">&quot;com.mkhsueh.example.mapper.namespace&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="nt">&lt;sql</span> <span class="na">id=</span><span class="s">&quot;purchase&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        pp.
+</span><span class='line'>    <span class="nt">&lt;/sql&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;/mapper&gt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Now we substitute the hardcoded namespace with references:</p>
+
+<figure class='code'><figcaption><span>common-methods.xml</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class='xml'><span class='line'><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+</span><span class='line'><span class="cp">&lt;!DOCTYPE mapper PUBLIC &quot;-//mybatis.org//DTD Mapper 3.0//EN&quot; &quot;http://mybatis.org/dtd/mybatis-3-mapper.dtd&quot;&gt;</span>
+</span><span class='line'><span class="nt">&lt;mapper</span> <span class="na">namespace=</span><span class="s">&quot;com.mkhsueh.example.mapper&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="nt">&lt;sql</span> <span class="na">id=</span><span class="s">&quot;excludeFailed&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        LEFT JOIN <span class="nt">&lt;include</span> <span class="na">refid=</span><span class="s">&quot;com.mkhsueh.example.mapper.namespace.purchase&quot;</span> <span class="nt">/&gt;</span>object o
+</span><span class='line'>        ON (failureCandidates.customer_id = o.source_id)
+</span><span class='line'>        LEFT JOIN <span class="nt">&lt;include</span> <span class="na">refid=</span><span class="s">&quot;com.mkhsueh.example.mapper.namespace.purchase&quot;</span> <span class="nt">/&gt;</span>object_type ot
+</span><span class='line'>        ON ot.object_type_id = o.object_type_id
+</span><span class='line'>        WHERE o.source_id IS NULL OR
+</span><span class='line'>        (ot.type = &#39;Purchase&#39; AND o.failure_count = 0)
+</span><span class='line'>  <span class="nt">&lt;/sql&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;/mapper&gt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>At this step, the key observation is that our mapping files are encapsulated in MyBatis session factories, and those factories can be tied to profiles.</p>
+
+<figure class='code'><figcaption><span>session-factories.xml</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+</pre></td><td class='code'><pre><code class='xml'><span class='line'><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+</span><span class='line'><span class="nt">&lt;beans</span> <span class="na">xmlns=</span><span class="s">&quot;http://www.springframework.org/schema/beans&quot;</span>
+</span><span class='line'>    <span class="na">xmlns:xsi=</span><span class="s">&quot;http://www.w3.org/2001/XMLSchema-instance&quot;</span>
+</span><span class='line'>    <span class="na">xsi:schemaLocation=</span><span class="s">&quot;http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>    <span class="c">&lt;!-- imports --&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;import</span> <span class="na">resource=</span><span class="s">&quot;classpath:/spring/spring-datasource.xml&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="c">&lt;!-- dao; by default, use prod namespace --&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;sqlSessionFactory&quot;</span> <span class="na">class=</span><span class="s">&quot;org.mybatis.spring.SqlSessionFactoryBean&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;dataSource&quot;</span> <span class="na">ref=</span><span class="s">&quot;dataSource&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;mapperLocations&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;list&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/service-methods.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/common-methods.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/namespace-prod.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;/list&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/property&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;typeHandlers&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;list&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;bean</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.DateTimeTypeHandler&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;/list&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/property&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="c">&lt;!-- profile to use prod namespace --&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;beans</span> <span class="na">profile=</span><span class="s">&quot;prod&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;sqlSessionFactory&quot;</span> <span class="na">class=</span><span class="s">&quot;org.mybatis.spring.SqlSessionFactoryBean&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;dataSource&quot;</span> <span class="na">ref=</span><span class="s">&quot;dataSource&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;mapperLocations&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;list&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/service-methods.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/common-methods.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/namespace-prod.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;/list&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/property&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;typeHandlers&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;list&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;bean</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.DateTimeTypeHandler&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;/list&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/property&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;/beans&gt;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="c">&lt;!-- profile to use qa namespace --&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;beans</span> <span class="na">profile=</span><span class="s">&quot;qa&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;sqlSessionFactory&quot;</span> <span class="na">class=</span><span class="s">&quot;org.mybatis.spring.SqlSessionFactoryBean&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;dataSource&quot;</span> <span class="na">ref=</span><span class="s">&quot;dataSource&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;mapperLocations&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;list&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/service-methods.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/common-methods.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;value&gt;</span>classpath:/mapper/namespace-qa.xml<span class="nt">&lt;/value&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;/list&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/property&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;typeHandlers&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;list&gt;</span>
+</span><span class='line'>                <span class="nt">&lt;bean</span> <span class="na">class=</span><span class="s">&quot;com.mkhsueh.example.DateTimeTypeHandler&quot;</span> <span class="nt">/&gt;</span>
+</span><span class='line'>            <span class="nt">&lt;/list&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;/property&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;/beans&gt;</span>
+</span><span class='line'><span class="nt">&lt;/beans&gt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Supply the session factory bean to the DAO layer:</p>
+
+<figure class='code'><figcaption><span>spring-dao.xml</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class='xml'><span class='line'><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+</span><span class='line'><span class="nt">&lt;beans</span> <span class="na">xmlns=</span><span class="s">&quot;http://www.springframework.org/schema/beans&quot;</span>
+</span><span class='line'>  <span class="na">xmlns:xsi=</span><span class="s">&quot;http://www.w3.org/2001/XMLSchema-instance&quot;</span>
+</span><span class='line'>  <span class="na">xsi:schemaLocation=</span><span class="s">&quot;http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>  <span class="c">&lt;!-- imports --&gt;</span>
+</span><span class='line'>  <span class="nt">&lt;import</span> <span class="na">resource=</span><span class="s">&quot;classpath:/spring/spring-datasource-sessionFactory.xml&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>    <span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;purchaseMapper&quot;</span> <span class="na">class=</span><span class="s">&quot;org.mybatis.spring.mapper.MapperFactoryBean&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;mapperInterface&quot;</span> <span class="na">value=</span><span class="s">&quot;com.mkhsueh.example.mapper.CustomerMapper&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;sqlSessionFactory&quot;</span> <span class="na">ref=</span><span class="s">&quot;sqlSessionFactory&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="nt">&lt;bean</span> <span class="na">id=</span><span class="s">&quot;purchaseMapperCommon&quot;</span> <span class="na">class=</span><span class="s">&quot;org.mybatis.spring.mapper.MapperFactoryBean&quot;</span><span class="nt">&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;mapperInterface&quot;</span> <span class="na">value=</span><span class="s">&quot;com.mkhsueh.example.common.mapper.CustomerMapper&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>        <span class="nt">&lt;property</span> <span class="na">name=</span><span class="s">&quot;sqlSessionFactory&quot;</span> <span class="na">ref=</span><span class="s">&quot;sqlSessionFactory&quot;</span><span class="nt">/&gt;</span>
+</span><span class='line'>    <span class="nt">&lt;/bean&gt;</span>
+</span><span class='line'>
+</span><span class='line'><span class="nt">&lt;/beans&gt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Now when the application is invoked with VM args <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>-Dspring.profiles.active=&ldquo;prod&rdquo;</span></code></pre></td></tr></table></div></figure> the session factory that loads namespace-prod.xml gets constructed and injected into the DAO object.</p>
+]]></content>
+  </entry>
+  
+</feed>

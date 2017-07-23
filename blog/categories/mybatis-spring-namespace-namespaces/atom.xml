@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: Mybatis,spring,namespace,namespaces | /home/mkhsueh]]></title>
+  <link href="http://mkhsueh.github.io/blog/categories/mybatis-spring-namespace-namespaces/atom.xml" rel="self"/>
+  <link href="http://mkhsueh.github.io/"/>
+  <updated>2017-07-22T15:55:57-07:00</updated>
+  <id>http://mkhsueh.github.io/</id>
+  <author>
+    <name><![CDATA[Michael K Hsueh]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[Environment Namespacing With MyBatis and Spring]]></title>
+    <link href="http://mkhsueh.github.io/blog/2015/01/26/namespacing-per-environment-with-mybatis-and-spring/"/>
+    <updated>2015-01-26T19:16:47-08:00</updated>
+    <id>http://mkhsueh.github.io/blog/2015/01/26/namespacing-per-environment-with-mybatis-and-spring</id>
+    <content type="html"><![CDATA[<p>While working with a recent customer, a set of database tables had been namespaced differently in the QA and production environments. Ideally, the namespaces should mirror one another. Unfortunately the DB replication topology was constrained to one slave host, and there would have been a namespace collision. Shucks! In this post, I&rsquo;ll explain how we managed namespaces for different environments using the MyBatis mapping layer with Spring configuration.</p>
+
+<!-- more -->
+
+
+<p>By decomposing the XML configuration, it&rsquo;s possible to select desired namespaces via Spring profiles. For reference, Spring profiles effectively group bean definitions, which are instantiated when the profiles are invoked.</p>
+
+<p>We start by examining sample MyBatis mapper files. Let&rsquo;s say we want to handle multiple namespaces for the &ldquo;object&rdquo; table:</p>
+
+<pre><code class="xml common-methods.xml">
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd"&gt;
+&lt;mapper namespace="com.mkhsueh.example.mapper"&gt;
+
+    &lt;sql id="excludeFailed"&gt;
+        LEFT JOIN pp.object o
+        ON (failureCandidates.customer_id = o.source_id)
+        LEFT JOIN pp.object_type ot
+        ON ot.object_type_id = o.object_type_id 
+        WHERE o.source_id IS NULL OR
+        (ot.type = 'Purchase' AND o.failure_count = 0)
+    &lt;/sql&gt;
+
+&lt;/mapper&gt;
+</code></pre>
+
+<p>A <sql> tag denotes SQL fragments that can be reused within the same file, or any other file loaded by the same session factory. The first thing we do is abstract the namespace into a SQL fragment, such that we can refer to it via the refid.</p>
+
+<p>Represent the namespace fragments in their own configuration files:</p>
+
+<pre><code class="xml namespace-qa.xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd"&gt;
+&lt;mapper namespace="com.mkhsueh.example.mapper.namespace"&gt;
+
+    &lt;sql id="purchase"&gt;
+        pq.
+    &lt;/sql&gt;
+
+&lt;/mapper&gt;
+</code></pre>
+
+<pre><code class="xml namespace-prod.xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd"&gt;
+&lt;mapper namespace="com.mkhsueh.example.mapper.namespace"&gt;
+
+    &lt;sql id="purchase"&gt;
+        pp.
+    &lt;/sql&gt;
+
+&lt;/mapper&gt;
+</code></pre>
+
+<p>Now we substitute the hardcoded namespace with references:</p>
+
+<pre><code class="xml common-methods.xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd"&gt;
+&lt;mapper namespace="com.mkhsueh.example.mapper"&gt;
+
+    &lt;sql id="excludeFailed"&gt;
+        LEFT JOIN &lt;include refid="com.mkhsueh.example.mapper.namespace.purchase" /&gt;object o
+        ON (failureCandidates.customer_id = o.source_id)
+        LEFT JOIN &lt;include refid="com.mkhsueh.example.mapper.namespace.purchase" /&gt;object_type ot
+        ON ot.object_type_id = o.object_type_id 
+        WHERE o.source_id IS NULL OR
+        (ot.type = 'Purchase' AND o.failure_count = 0)
+    &lt;/sql&gt;
+
+&lt;/mapper&gt;
+</code></pre>
+
+<p>At this step, the key observation is that our mapping files are encapsulated in MyBatis session factories, and those factories can be tied to profiles.</p>
+
+<pre><code class="xml session-factories.xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd"&gt;
+    &lt;!-- imports --&gt;
+    &lt;import resource="classpath:/spring/spring-datasource.xml"/&gt;
+
+    &lt;!-- dao; by default, use prod namespace --&gt;
+    &lt;bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean"&gt;
+        &lt;property name="dataSource" ref="dataSource"/&gt;
+        &lt;property name="mapperLocations"&gt;
+            &lt;list&gt;
+                &lt;value&gt;classpath:/mapper/service-methods.xml&lt;/value&gt;
+                &lt;value&gt;classpath:/mapper/common-methods.xml&lt;/value&gt;
+                &lt;value&gt;classpath:/mapper/namespace-prod.xml&lt;/value&gt;
+            &lt;/list&gt;
+        &lt;/property&gt;
+        &lt;property name="typeHandlers"&gt;
+            &lt;list&gt;
+                &lt;bean class="com.mkhsueh.example.DateTimeTypeHandler" /&gt;
+            &lt;/list&gt;
+        &lt;/property&gt;
+    &lt;/bean&gt;
+
+    &lt;!-- profile to use prod namespace --&gt;
+    &lt;beans profile="prod"&gt;
+    &lt;bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean"&gt;
+        &lt;property name="dataSource" ref="dataSource"/&gt;
+        &lt;property name="mapperLocations"&gt;
+            &lt;list&gt;
+                &lt;value&gt;classpath:/mapper/service-methods.xml&lt;/value&gt;
+                &lt;value&gt;classpath:/mapper/common-methods.xml&lt;/value&gt;
+                &lt;value&gt;classpath:/mapper/namespace-prod.xml&lt;/value&gt;
+            &lt;/list&gt;
+        &lt;/property&gt;
+        &lt;property name="typeHandlers"&gt;
+            &lt;list&gt;
+                &lt;bean class="com.mkhsueh.example.DateTimeTypeHandler" /&gt;
+            &lt;/list&gt;
+        &lt;/property&gt;
+    &lt;/bean&gt;
+    &lt;/beans&gt;  
+
+    &lt;!-- profile to use qa namespace --&gt;
+    &lt;beans profile="qa"&gt;
+    &lt;bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean"&gt;
+        &lt;property name="dataSource" ref="dataSource"/&gt;
+        &lt;property name="mapperLocations"&gt;
+            &lt;list&gt;
+                &lt;value&gt;classpath:/mapper/service-methods.xml&lt;/value&gt;
+                &lt;value&gt;classpath:/mapper/common-methods.xml&lt;/value&gt;
+                &lt;value&gt;classpath:/mapper/namespace-qa.xml&lt;/value&gt;
+            &lt;/list&gt;
+        &lt;/property&gt;
+        &lt;property name="typeHandlers"&gt;
+            &lt;list&gt;
+                &lt;bean class="com.mkhsueh.example.DateTimeTypeHandler" /&gt;
+            &lt;/list&gt;
+        &lt;/property&gt;
+    &lt;/bean&gt;
+    &lt;/beans&gt;  
+&lt;/beans&gt;
+</code></pre>
+
+<p>Supply the session factory bean to the DAO layer:</p>
+
+<pre><code class="xml spring-dao.xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd"&gt;
+    &lt;!-- imports --&gt;
+    &lt;import resource="classpath:/spring/spring-datasource-sessionFactory.xml"/&gt;
+
+
+    &lt;bean id="purchaseMapper" class="org.mybatis.spring.mapper.MapperFactoryBean"&gt;
+        &lt;property name="mapperInterface" value="com.mkhsueh.example.mapper.CustomerMapper"/&gt;
+        &lt;property name="sqlSessionFactory" ref="sqlSessionFactory"/&gt;
+    &lt;/bean&gt;
+
+    &lt;bean id="purchaseMapperCommon" class="org.mybatis.spring.mapper.MapperFactoryBean"&gt;
+        &lt;property name="mapperInterface" value="com.mkhsueh.example.common.mapper.CustomerMapper"/&gt;
+        &lt;property name="sqlSessionFactory" ref="sqlSessionFactory"/&gt;
+    &lt;/bean&gt;
+
+&lt;/beans&gt;
+</code></pre>
+
+<p>Now when the application is invoked with VM args <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>-Dspring.profiles.active=&ldquo;prod&rdquo;</span></code></pre></td></tr></table></div></figure> the session factory that loads namespace-prod.xml gets constructed and injected into the DAO object.</p>
+]]></content>
+  </entry>
+  
+</feed>

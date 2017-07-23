@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: Performance Engineering | /home/mkhsueh]]></title>
+  <link href="http://mkhsueh.github.io/blog/categories/performance-engineering/atom.xml" rel="self"/>
+  <link href="http://mkhsueh.github.io/"/>
+  <updated>2017-07-22T15:55:57-07:00</updated>
+  <id>http://mkhsueh.github.io/</id>
+  <author>
+    <name><![CDATA[Michael K Hsueh]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[Performance Engineering With a Pipelined Directed Acyclic Graph Pattern]]></title>
+    <link href="http://mkhsueh.github.io/blog/2015/05/13/performance-engineering-with-a-pipelined-directed-acyclic-graph-pattern/"/>
+    <updated>2015-05-13T17:17:47-07:00</updated>
+    <id>http://mkhsueh.github.io/blog/2015/05/13/performance-engineering-with-a-pipelined-directed-acyclic-graph-pattern</id>
+    <content type="html"><![CDATA[<p>On a recent large-scale data migration project, my team encountered throughput issues for a service being developed in our data pipeline. This particular service drove our automated migration, and we needed to scale by orders of magnitude in order to meet the launch schedule. Beginning with addressing bottlenecks and tuning runtime parameters, various performance improvements were made; an optimization that helped us go the distance was rethinking single-threaded sequential execution as a pipelined directed acyclic graph (DAG) execution.</p>
+
+<!-- more -->
+
+
+<p>The particular service under discussion works by continuously streaming and processing data in batches. Up until the point of considering architectural redesign, various parts of the application had been tuned or otherwise parallelized as much as our network/hardware could support. There would be little to no performance benefit from throwing more threads at the issue in a brute-force manner. The key observation at this point was that we would need our slowest I/O-bound processes to run not only as quickly as possible, but as much of the time as possible.</p>
+
+<p>One main loop consisting of several major tasks was executing sequentially. By multithreading the entire main process, we could process multiple batches simultaneously. Conveniently, the main process was already encapsulated as a job. A single threaded execution was done via <a href="http://docs.spring.io/spring/docs/current/javadoc-api/org/springframework/scheduling/concurrent/ThreadPoolTaskExecutor.html">ThreadPoolTaskExecutor.scheduleWithFixedDelay()</a> to allow the entire batch to finish before repeating. What we needed to do here was first change the ThreadPoolTaskExecutor to use scheduleAtFixedRate() and allow concurrent executions. To guard against excessive memory usage by queued tasks, a discard policy was configured for this top-level executor.</p>
+
+<p>Now, what does that accomplish? We&rsquo;re adding more parallelism at the task level, but as stated before, parallelism for individual stages was already achieved by other optimizations. The next step was to actually &ldquo;gate&rdquo; each stage in the process to force pipelining and parallelization of different tasks. To do this, some changes needed to happen:
+</p>
+<strong>1)</strong> Each stage was encapsulated inside a Callable. Callables for intermediate stages were further wrapped inside an <a href="http://docs.guava-libraries.googlecode.com/git-history/v11.0.2/javadoc/com/google/common/util/concurrent/AsyncFunction.html">AsyncFunction</a>.</p>
+
+<p></p></p>
+
+<p><strong>2)</strong> A separate <a href="http://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ExecutorService.html">ExecutorService</a> was used to run each stage. Native Java ExecutorService instances were converted into Guava&rsquo;s ListeningExecutorService to support successive chaining of tasks (via <a href="http://docs.guava-libraries.googlecode.com/git/javadoc/com/google/common/util/concurrent/ListenableFuture.html">ListenableFuture</a> instances returned). Using separate executors for each task allowed different types of tasks to run   in parallel.</p>
+
+<p>Simply running multiple threads through the execution of all tasks at once might have produced this behavior. However, using that approach does not guarantee whether executions end up staggered across I/O intensive stages or all within the same stage.</p>
+
+<p><strong>3)</strong> Splitting sequential tasks into a graph:
+<img class="center" src="/images/DAG_conversion.png" title="&lsquo;Conversion of Sequential Tasks into Task Graph&rsquo; &lsquo;Conversion of Sequential Tasks into Task Graph&rsquo;" ></p>
+
+<p>Pipelining in itself is certainly an improvement. Now that tasks were encapsulated as Callables, independent tasks could run in parallel. Various stages are kicked off and joined using <code>transform()</code> and <code>get()</code>; intermediate stages are represented as an AsyncFunction used to transform results from dependency tasks. The image above shows before/after arrangement of tasks for our application.</p>
+
+<pre><code class="java fork-join example using ListenableFuture">
+ private final ListeningExecutorService executorServiceA = MoreExecutors.listeningDecorator(Executors.newFixedThreadPool(2));
+ private final ListeningExecutorService executorServiceB = MoreExecutors.listeningDecorator(Executors.newFixedThreadPool(2));
+
+// ...
+
+        ListenableFuture&lt;List&lt;Result&gt;&gt; taskAFuture = executorServiceA
+                .submit(new Callable&lt;List&lt;Result&gt;&gt;() {
+                    public List&lt;Result&gt; call() {
+                        final List&lt;Result&gt; result = attemptOperation();
+                        // business logic, return result
+                    }
+                });
+
+        AsyncFunction&lt;List&lt;Result&gt;, List&lt;Integer&gt;&gt; functionB = new AsyncFunction&lt;List&lt;Result&gt;, List&lt;Integer&gt;&gt;() {
+
+            @Override
+            public ListenableFuture&lt;List&lt;Integer&gt;&gt; apply(
+                    final List&lt;Result&gt; input) throws Exception {
+                return executorServiceB
+                        .submit(new Callable&lt;List&lt;Integer&gt;&gt;() {
+
+                            @Override
+                            public List&lt;Integer&gt; call() throws Exception {
+                                // business logic, return result
+                            }
+                        });
+            }
+        };
+
+        ListenableFuture&lt;List&lt;Integer&gt;&gt; intermediateFuture = Futures.transform(taskAFuture, functionB);
+
+        // other tasks are initialized, with varying degrees of fanout and joining
+
+        Futures.allAsList(finalFutureX, finalFutureY).get();
+</code></pre>
+
+<p>An initial solution was delivered under operational/timeline constraints with the above approach. Just imagine more stages with more interdependencies. Examined in isolation, the result was an increase in throughput, by a factor of approximately 1.83x. Keep in mind, an architectural reorganization can compound upon smaller changes; combined with other optimizations made to this app, we&rsquo;ve seen up to a 132x peak gain in production throughput.</p>
+
+<p><strong>An aside on tuning thread count and executor services for various stages:</strong></p>
+
+<p>I believe in using threads judiciously (I know, it&rsquo;s tempting to add an extra 0 to that thread config). For our particular case, there were two heavily I/O bound stages, with the others being negligible or relatively quick. The number of threads executing the graph were set to two&ndash; allowing each expensive stage to run nearly continuously. Furthermore, the executors for those expensive stages were configured with a thread pool size of one. As a test, the executors&#8217; pool sizes were increased to two. This actually caused a degradation in performance by 0.877s for a sample dataset; To understand why this happens, let&rsquo;s look at the visualization of application state. The chart below (part of a monitoring dashboard built using Splunk) shows what happened when the two stages were constrained to one thread each. Tasks represented by the orange bars represent the second most time-intensive stage. Once our pipeline fully engages each stage, we should expect to get the cost of stage-orange for free (on a timescale only), except for the initial occurrence. In other words, that task&rsquo;s execution is overshadowed by the most expensive stage.</p>
+
+<p><img class="center" src="/images/flipper_state_diagram_one_thread.png" title="&lsquo;Application State Transition Diagram&rsquo;" ></p>
+
+<p>Once thread count is increased, the two threads may concurrently attempt to perform the same stage, splitting available resources. If we examine the total cost of N-1 stage-orange runs, we see that roughly accounts for the one second increase in runtime.</p>
+
+<pre><code> estimated times for ops, not counting the initial execution:
+ 0.102s + 0.108s + 0.119s + 0.1s + 0.121s + 0.094s
+ total = 0.644s
+
+ difference in trial run times: 17.474-16.597 = 0.877s
+
+ 0.644s accounts for most of the difference in performance
+ - of course, there may have been some variability due to network performance
+</code></pre>
+
+<p><strong>Generalizing the design:</strong></p>
+
+<p>Manually stringing up a series of asynchronous tasks and transformations isn&rsquo;t exactly the picture of maintainability and extensibility we want to see in our applications. The next challenge was refactoring this process to make it reuseable and configurable. We can decompose this pattern into the following:</p>
+
+<ul>
+<li>specification of tasks as a graph</li>
+<li>chaining and joining of tasks</li>
+</ul>
+
+
+<p>Each &ldquo;stage&rdquo; or task was rewritten as a <a href="http://docs.guava-libraries.googlecode.com/git/javadoc/com/google/common/base/Function.html">Function</a>&lt;I, O> class. Defining a task graph was done by specifying the list of dependencies for each stage, along with the work encapsulated within a Function, and the executor service for each stage. That gives us all the specifications we need to initiate a stage. Essentially, we used a modified adjacency list representation for a graph.</p>
+
+<p>To automatically initiate tasks in dependency order, a depth-first search was performed from each task in the graph. No task begins executing until dependencies complete, and results from the dependencies are passed into the function. We could have done a topological sort to determine dependency ordering. However, the implementation was simplified using the design assumption that crawling the graph and initializing tasks in memory is relatively inexpensive (on the order of milliseconds, happening once per graph execution).</p>
+
+<p>We also needed to validate the graph as an acyclic graph; cycles could cause tasks to block on execution, or even a stack overflow error from recursively initializing dependencies. The graph is first validated by a custom <code>AcyclicGraph</code> class, which is then consumed by a <code>TaskGraphExecutor</code> that executes the graph. Internally, the <code>AcyclicGraph</code> is backed by a task graph mapping (adjacency list-like representation discussed earlier). The task graph mapping is created in Spring via XML configuration as a map. Excluding writing new services, we can configure executor services for each stage, reconfigure the graph, or incorporate new tasks using XML&ndash; all without touching any Java application code.</p>
+
+<p>The <code>TaskGraphExecutor</code> executes a task graph. You&rsquo;ll notice that working with <code>ListenableFuture</code> gives us the added convenience of choosing an asynchronous or synchronous computation of the overall graph, exposed by <code>computeGraphAsync()</code> and <code>computeGraphSynchronously()</code>.</p>
+
+<pre><code class="java executor for an acyclic task graph https://gist.github.com/mkhsueh/d75cd6bc2ed3b61a947f gist">
+package com.mkhsueh.example.pipeline;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.AsyncFunction;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+
+import static com.google.common.base.Preconditions.*;
+
+/**
+ * Executes a directed acyclic graph of tasks. Thread-safe. 
+ *
+ * @param &lt;I&gt; the return type of tasks
+ * @author Michael K Hsueh
+ */
+public class TaskGraphExecutor &lt;I&gt; {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TaskGraphExecutor.class); 
+    private final AcyclicGraph&lt;TaskGraphTuple&lt;List&lt;I&gt;, I&gt;&gt; taskGraph;
+
+    /**
+     * 
+     * @param taskGraph
+     *            represents a description of a directed acyclic graph of tasks.
+     *            Keys are vertexes, and each {@link TaskGraphTuple} contains a
+     *            listing of the dependencies for that vertex--edges flow from
+     *            the dependencies to the current vertex. Task graphs with
+     *            cycles are considered invalid and will not execute.
+     */
+    public TaskGraphExecutor(
+            AcyclicGraph&lt;TaskGraphTuple&lt;List&lt;I&gt;, I&gt;&gt; taskGraph) {
+        this.taskGraph = checkNotNull(taskGraph);
+    }
+
+    /**
+     * Initializes task graph and returns an aggregate future. Caller should
+     * block on future.get() to wait for completion.
+     * 
+     * @return aggregate future
+     */
+    public ListenableFuture&lt;List&lt;I&gt;&gt; computeGraphAsync() {
+
+        Map&lt;String, ListenableFuture&lt;I&gt;&gt; futuresMapping = new HashMap&lt;String, ListenableFuture&lt;I&gt;&gt;();
+
+        for (String key : taskGraph.keySet()) {
+            populateFuture(key, futuresMapping);
+        }
+
+        return Futures.allAsList(futuresMapping.values());
+    }
+
+    /**
+     * Returns final result list from the task graph once all tasks complete.
+     * The actual graph execution can still run with parallelization as
+     * configured.
+     * 
+     * @return aggregate results
+     * @throws InterruptedException
+     * @throws ExecutionException
+     */
+    public List&lt;I&gt; computeGraphSynchronously() throws InterruptedException, ExecutionException {
+        return computeGraphAsync().get();
+    }
+
+    private ListenableFuture&lt;I&gt; populateFuture(String key, Map&lt;String, ListenableFuture&lt;I&gt;&gt; futuresMapping) {
+        final TaskGraphTuple&lt;List&lt;I&gt;, I&gt; tuple = taskGraph.get(key);
+        List&lt;String&gt; dependencyKeys = tuple.getDependencyKeys();
+
+        if (notStarted(key, futuresMapping)) {
+            // use dependencies
+            AsyncFunction&lt;List&lt;I&gt;, I&gt; taskAsFxn = tuple.getAsyncFunction();
+            try {
+                ListenableFuture&lt;List&lt;I&gt;&gt; dependencies = startAndGetAggregateDependencies(dependencyKeys, futuresMapping);
+                futuresMapping.put(key, Futures.transform(dependencies, taskAsFxn));
+            } catch (ClassCastException e) {
+                String msg = String.format("Unexpected input types from dependency tasks [%s] for task [%s]", dependencyKeys, key);
+                LOG.error(msg, e);
+                throw new RuntimeException(msg, e);
+            } catch (NullPointerException e) {
+                String msg = String.format("Null pointer given dependency tasks [%s] for task [%s]; check configuration to ensure required dependencies were specified for the task",
+                                dependencyKeys, key);
+                LOG.error(msg, e);
+                throw new RuntimeException(msg, e);
+            }
+        }
+
+        return futuresMapping.get(key);
+    }
+
+    private boolean notStarted(String key,
+            Map&lt;String, ListenableFuture&lt;I&gt;&gt; futuresMapping) {
+        return futuresMapping.get(key) == null;
+    }
+
+    private ListenableFuture&lt;List&lt;I&gt;&gt; startAndGetAggregateDependencies(List&lt;String&gt; dependencyKeys,
+            Map&lt;String, ListenableFuture&lt;I&gt;&gt; futuresMapping) {
+        List&lt;ListenableFuture&lt;I&gt;&gt; dependencyFutures = Lists.newArrayList();
+
+        // handle independent task
+        if (dependencyKeys.isEmpty()) {
+            return Futures.immediateFuture(null); // null avoids cast errors;
+                                                  // reasonably safe
+                                                  // since independent tasks
+                                                  // should not read inputs
+        }
+
+        for (String key : dependencyKeys) {
+            if (notStarted(key, futuresMapping)) {
+                populateFuture(key, futuresMapping);
+            } 
+        }
+
+        for (String key : dependencyKeys) {
+            ListenableFuture&lt;I&gt; dependencyFuture = futuresMapping.get(key);
+            dependencyFutures.add(dependencyFuture);
+        }
+
+        return Futures.allAsList(dependencyFutures);     
+    }
+
+}
+</code></pre>
+
+<p>Below is the helper class <code>TaskGraphTuple</code>, which encapsulates converting <code>Function</code> to <code>AsyncFunction</code>.</p>
+
+<pre><code class="java TaskGraphTuple.java">
+package com.mkhsueh.example.pipeline;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+
+import com.google.common.base.Function;
+import com.google.common.util.concurrent.AsyncFunction;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ListeningExecutorService;
+import com.google.common.util.concurrent.MoreExecutors;
+
+import static com.google.common.base.Preconditions.*;
+
+public class TaskGraphTuple&lt;I, O&gt; {
+
+    private final List&lt;String&gt; dependencyKeys;
+    private final Function&lt;I, O&gt; function;
+    private final ListeningExecutorService executorService;
+    private AsyncFunction&lt;I, O&gt; asyncFunction;
+
+    public TaskGraphTuple(List&lt;String&gt; dependencyKeys, Function&lt;I, O&gt; task, ExecutorService executorService) {
+        this.dependencyKeys = checkNotNull(dependencyKeys);
+        this.function = checkNotNull(task);
+        this.executorService = MoreExecutors.listeningDecorator(checkNotNull(executorService));
+        this.asyncFunction = createAsyncFunction(this.function, this.executorService);
+    }
+
+    private AsyncFunction&lt;I, O&gt; createAsyncFunction(
+            final Function&lt;I, O&gt; fxn,
+            final ListeningExecutorService executorService) {
+        return new AsyncFunction&lt;I, O&gt;() {
+
+            @Override
+            public ListenableFuture&lt;O&gt; apply(final I input) throws Exception {
+                return executorService.submit(new Callable&lt;O&gt;() {
+
+                    @Override
+                    public O call() throws Exception {
+                        return fxn.apply(input);
+                    }
+                });
+            }
+
+        };
+    }
+
+    public List&lt;String&gt; getDependencyKeys() {
+        return Collections.unmodifiableList(dependencyKeys);
+    }
+
+    public Function&lt;I, O&gt; getFunction() {
+        return function;
+    }
+
+    public ListeningExecutorService getExecutorService() {
+        return executorService;
+    }
+
+    public AsyncFunction&lt;I, O&gt; getAsyncFunction() {
+        return asyncFunction;
+    }
+
+}
+</code></pre>
+
+<p>Lastly, here&rsquo;s an example configuration file. All the configuration is done in one file here for brevity.</p>
+
+<p>&#8220;`xml example Spring configuration file</p>
+
+<!-- pipeline stages -->
+
+
+<p><bean id="serviceA" class="com.mkhsueh.example.pipeline.ServiceA">
+      <constructor-arg ref="constructorArg1"/>
+      <constructor-arg ref="constructorArg2"/>
+</bean></p>
+
+<p><bean id="serviceB" class="com.mkhsueh.example.pipeline.ServiceB">
+      <constructor-arg ref="constructorArg1"/>
+      <constructor-arg ref="constructorArg2"/>
+</bean></p>
+
+<!-- task graph setup -->
+
+
+<p><bean id="executorA" class="com.mkhsueh.example.concurrent.ExecutorServiceFactory" factory-method="newFixedThreadPool">
+      <constructor-arg value="${serviceA.jobThreadPoolCount}" />
+      <constructor-arg value="${serviceA.jobThreadPoolName}" />
+</bean></p>
+
+<p><bean id="executorB" class="com.mkhsueh.example.concurrent.ExecutorServiceFactory" factory-method="newFixedThreadPool">
+      <constructor-arg value="${serviceB.jobThreadPoolCount}" />
+      <constructor-arg value="${serviceB.jobThreadPoolName}" />
+</bean></p>
+
+<p><bean id="tupleA"  class="com.mkhsueh.example.pipeline.TaskGraphTuple">
+      <constructor-arg>
+        <list></list>  <!-- dependency tasks go here -->
+      </constructor-arg>
+      <constructor-arg ref="serviceA" />
+      <constructor-arg ref="executorA" />
+</bean></p>
+
+<p><bean id="tupleB" class="com.mkhsueh.example.pipeline.TaskGraphTuple">
+      <constructor-arg>
+        <list>
+                <value>serviceA</value>
+        </list>
+      </constructor-arg>
+      <constructor-arg ref="serviceB" />
+      <constructor-arg ref="executorB" />
+</bean></p>
+
+<p><bean id="taskGraphMapping" class="java.util.HashMap">
+      <constructor-arg>
+        <map key-type="java.lang.String" value-type="com.mkhsueh.example.pipeline.TaskGraphTuple">
+             <entry key="serviceA" value-ref="tupleA" />
+             <entry key="serviceB" value-ref="tupleB" />
+        </map>
+      </constructor-arg>
+</bean></p>
+
+<p><bean id="acyclicTaskGraph" class="com.mkhsueh.example.pipeline.AcyclicTaskGraph">
+      <constructor-arg ref="taskGraphMapping" />
+</bean></p>
+
+<p><bean id="taskGraphExecutor" class="com.mkhsueh.example.pipeline.TaskGraphExecutor">
+      <constructor-arg ref="acyclicTaskGraph" />
+</bean></p>
+
+<p>&#8220;`</p>
+
+<p>Update 7/16/17:</p>
+
+<p>We used this system at Zappos to finalize customer data migrations in its Super Cloud infrastructure transition to Amazon. This morning, I learned the project had completed. Props to the team for closing what was likely the &ldquo;single largest e-commerce replatforming in history&rdquo;! <a href="http://highscalability.com/blog/2015/10/7/zapposs-website-frozen-for-two-years-as-it-integrates-with-a.html">[1]</a></p>
+]]></content>
+  </entry>
+  
+</feed>
