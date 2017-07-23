@@ -373,3 +373,7 @@ Lastly, here's an example configuration file. All the configuration is done in o
       <constructor-arg ref="acyclicTaskGraph" />
 </bean>
 ```
+
+**Update 7/16/17:**
+
+We used this system at Zappos to finalize customer data migrations in its Super Cloud infrastructure transition to Amazon. This morning, I learned the project had completed. Props to the team for closing what was likely the “single largest e-commerce replatforming in history”! <a href="https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=1&cad=rja&uact=8&ved=0ahUKEwjf9MTSkJ7VAhWLr1QKHW8_CFcQFggmMAA&url=http%3A%2F%2Fhighscalability.com%2Fblog%2F2015%2F10%2F7%2Fzapposs-website-frozen-for-two-years-as-it-integrates-with-a.html&usg=AFQjCNGrV2rbXENjR6SzhQza6Co-HBy4oA">[1]</a>
