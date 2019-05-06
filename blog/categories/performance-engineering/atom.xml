@@ -4,7 +4,7 @@
   <title><![CDATA[Category: Performance Engineering | /home/mkhsueh]]></title>
   <link href="http://mkhsueh.github.io/blog/categories/performance-engineering/atom.xml" rel="self"/>
   <link href="http://mkhsueh.github.io/"/>
-  <updated>2017-07-22T18:59:53-07:00</updated>
+  <updated>2019-05-05T20:58:47-07:00</updated>
   <id>http://mkhsueh.github.io/</id>
   <author>
     <name><![CDATA[Michael K Hsueh]]></name>
@@ -384,10 +384,6 @@ public class TaskGraphTuple&lt;I, O&gt; {
       <constructor-arg ref="acyclicTaskGraph" />
 </bean>
 &#8220;`</p>
-
-<p><strong>Update 7/16/17:</strong></p>
-
-<p>We used this system at Zappos to finalize customer data migrations in its Super Cloud infrastructure transition to Amazon. This morning, I learned the project had completed. Props to the team for closing what was likely the “single largest e-commerce replatforming in history”! <a href="https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=1&cad=rja&uact=8&ved=0ahUKEwjf9MTSkJ7VAhWLr1QKHW8_CFcQFggmMAA&url=http%3A%2F%2Fhighscalability.com%2Fblog%2F2015%2F10%2F7%2Fzapposs-website-frozen-for-two-years-as-it-integrates-with-a.html&usg=AFQjCNGrV2rbXENjR6SzhQza6Co-HBy4oA">[1]</a></p>
 ]]></content>
   </entry>
   
